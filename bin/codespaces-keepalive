@@ -1,0 +1,708 @@
+#!/bin/sh
+# Keep a GitHub Codespace awake on a crontab schedule.
+# POSIX sh — Linux, macOS, and anything with /bin/sh + gh.
+set -eu
+
+MARKER=codespaces-scheduled-keepalive
+DEFAULT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/codespaces-keepalive/config"
+
+cfg_timezone=UTC
+cfg_schedule=
+cfg_start_timeout_seconds=300
+cfg_heartbeat_command=true
+cfg_name=
+cfg_log_dir=
+cfg_debug=0
+debug=0
+log_file=
+
+die() {
+	line=$(printf '[%s] error: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*")
+	append_log "$line"
+	printf '%s' "$line" >&2
+	exit 1
+}
+
+append_log() {
+	[ -n "${log_file:-}" ] || return 0
+	printf '%s' "$1" >>"$log_file"
+}
+
+log() {
+	line=$(printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*")
+	append_log "$line"
+	if [ -t 1 ]; then
+		printf '%s' "$line"
+	fi
+}
+
+debug() {
+	[ "${debug:-0}" = 1 ] || return 0
+	log "debug: $*"
+}
+
+usage() {
+	cat <<'EOF'
+codespaces-keepalive — wake and keep a GitHub Codespace alive on a cron schedule
+
+Usage:
+  codespaces-keepalive tick [--force] [--dry-run] [--debug] [--log-dir DIR] [--config PATH]
+  codespaces-keepalive daemon [--dry-run] [--debug] [--log-dir DIR] [--config PATH]
+  codespaces-keepalive status [--debug] [--log-dir DIR] [--config PATH]
+  codespaces-keepalive install cron|systemd|launchd [--apply] [--debug] [--config PATH]
+
+tick     One-shot. Noop unless `schedule` matches now; otherwise start + heartbeat.
+daemon   Loop every minute and call tick (for hosts without cron).
+status   Print schedule membership and the named codespace.
+install  Print (or --apply) an OS timer that runs tick.
+
+--debug, -d   Verbose logs (schedule miss/match, gh calls, wait loops).
+--log-dir DIR Override config log_dir for this run.
+
+Logs go to log_dir/keepalive.log (config `log_dir`, default
+$XDG_STATE_HOME/codespaces-keepalive). Cron/systemd/launchd are not ttys, so
+without --debug those runs only write the log file (no mail/journal spam).
+
+`schedule` is a 5-field crontab expression (minute hour dom month weekday),
+evaluated in `timezone`. All five fields must match (no Vixie DOM/DOW OR quirk).
+
+  install cron     uses `schedule` as the crontab (tick --force so a late fire still runs)
+  systemd/launchd  wake every minute; tick itself applies `schedule` (silent skip)
+EOF
+}
+
+script_path() {
+	dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+	printf '%s/%s\n' "$dir" "$(basename -- "$0")"
+}
+
+# Strip leading zeros so $((08)) is not parsed as invalid octal.
+unpad() {
+	n=$1
+	while :; do
+		case $n in
+		0[0-9]*) n=${n#0} ;;
+		*) break ;;
+		esac
+	done
+	printf '%s\n' "${n:-0}"
+}
+
+is_int() {
+	case $1 in
+	'' | *[!0-9]*) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
+normalize_ws() {
+	printf '%s\n' "$1" | tr -s '[:space:]' ' '
+}
+
+expand_path() {
+	p=$1
+	t='~'
+	if [ "$p" = "$t" ]; then
+		printf '%s\n' "$HOME"
+	elif [ "${p#"$t"/}" != "$p" ]; then
+		printf '%s/%s\n' "$HOME" "${p#"$t"/}"
+	else
+		printf '%s\n' "$p"
+	fi
+}
+
+parse_bool() {
+	case "$1" in
+	true | yes | on | 1) printf '1\n' ;;
+	false | no | off | 0 | '') printf '0\n' ;;
+	*) die "expected true/false, got $1" ;;
+	esac
+}
+
+setup_logging() {
+	if [ -z "$cfg_log_dir" ]; then
+		cfg_log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/codespaces-keepalive"
+	fi
+	cfg_log_dir=$(expand_path "$cfg_log_dir")
+	mkdir -p "$cfg_log_dir" || die "cannot create log_dir $cfg_log_dir"
+	log_file="$cfg_log_dir/keepalive.log"
+	debug "log_file=$log_file timezone=$cfg_timezone schedule=$cfg_schedule name=$cfg_name"
+}
+
+expand_cron_names() {
+	kind=$1
+	spec=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+	case $kind in
+	dow)
+		spec=$(printf '%s' "$spec" | sed \
+			-e 's/thursday/4/g' -e 's/thur/4/g' -e 's/thu/4/g' \
+			-e 's/sunday/0/g' -e 's/saturday/6/g' -e 's/tuesday/2/g' \
+			-e 's/wednesday/3/g' -e 's/monday/1/g' -e 's/friday/5/g' \
+			-e 's/tues/2/g' -e 's/wed/3/g' -e 's/mon/1/g' \
+			-e 's/tue/2/g' -e 's/fri/5/g' -e 's/sat/6/g' -e 's/sun/0/g')
+		;;
+	month)
+		spec=$(printf '%s' "$spec" | sed \
+			-e 's/january/1/g' -e 's/february/2/g' -e 's/september/9/g' \
+			-e 's/october/10/g' -e 's/november/11/g' -e 's/december/12/g' \
+			-e 's/august/8/g' -e 's/march/3/g' -e 's/april/4/g' \
+			-e 's/june/6/g' -e 's/july/7/g' -e 's/may/5/g' \
+			-e 's/jan/1/g' -e 's/feb/2/g' -e 's/mar/3/g' -e 's/apr/4/g' \
+			-e 's/jun/6/g' -e 's/jul/7/g' -e 's/aug/8/g' -e 's/sep/9/g' \
+			-e 's/oct/10/g' -e 's/nov/11/g' -e 's/dec/12/g')
+		;;
+	esac
+	printf '%s\n' "$spec"
+}
+
+# Sets p_start p_end p_step from a single cron token (*, */n, a-b, a-b/n, a/n, a).
+cron_parse_token() {
+	tok=$1
+	lo=$2
+	hi=$3
+	p_step=1
+	case $tok in
+	\*/*)
+		p_start=$lo
+		p_end=$hi
+		p_step=${tok#*/}
+		;;
+	\*)
+		p_start=$lo
+		p_end=$hi
+		;;
+	*-*/*)
+		_range=${tok%%/*}
+		p_step=${tok#*/}
+		p_start=${_range%%-*}
+		p_end=${_range#*-}
+		;;
+	*-*)
+		p_start=${tok%%-*}
+		p_end=${tok#*-}
+		;;
+	*/*)
+		p_start=${tok%%/*}
+		p_end=$hi
+		p_step=${tok#*/}
+		;;
+	*)
+		p_start=$tok
+		p_end=$tok
+		;;
+	esac
+	p_start=$(unpad "$p_start")
+	p_end=$(unpad "$p_end")
+	p_step=$(unpad "$p_step")
+	is_int "$p_start" || die "cron token $tok: not a number"
+	is_int "$p_end" || die "cron token $tok: not a number"
+	is_int "$p_step" || die "cron token $tok: bad step"
+	[ "$p_step" -ge 1 ] || die "cron token $tok: step must be >= 1"
+	[ "$p_start" -ge "$lo" ] && [ "$p_start" -le "$hi" ] || die "cron token $tok: $p_start out of $lo-$hi"
+	[ "$p_end" -ge "$lo" ] && [ "$p_end" -le "$hi" ] || die "cron token $tok: $p_end out of $lo-$hi"
+	[ "$p_start" -le "$p_end" ] || die "cron token $tok: reversed range"
+}
+
+cron_token_matches() {
+	val=$1
+	tok=$2
+	lo=$3
+	hi=$4
+	kind=$5
+	cron_parse_token "$tok" "$lo" "$hi"
+	x=$p_start
+	while [ "$x" -le "$p_end" ]; do
+		cmp=$x
+		if [ "$kind" = dow ] && [ "$x" -eq 7 ]; then
+			cmp=0
+		fi
+		if [ "$cmp" -eq "$val" ]; then
+			if [ $(((x - p_start) % p_step)) -eq 0 ]; then
+				return 0
+			fi
+		fi
+		x=$((x + 1))
+	done
+	return 1
+}
+
+cron_field_matches() {
+	val=$1
+	spec=$2
+	lo=$3
+	hi=$4
+	kind=$5
+	spec=$(expand_cron_names "$kind" "$spec")
+	rest=$spec,
+	any=
+	while [ -n "$rest" ]; do
+		tok=${rest%%,*}
+		rest=${rest#*,}
+		[ -n "$tok" ] || continue
+		any=1
+		if cron_token_matches "$val" "$tok" "$lo" "$hi" "$kind"; then
+			return 0
+		fi
+	done
+	[ -n "$any" ] || die "empty cron field"
+	return 1
+}
+
+cron_field_validate() {
+	spec=$1
+	lo=$2
+	hi=$3
+	kind=$4
+	spec=$(expand_cron_names "$kind" "$spec")
+	rest=$spec,
+	any=
+	while [ -n "$rest" ]; do
+		tok=${rest%%,*}
+		rest=${rest#*,}
+		[ -n "$tok" ] || continue
+		any=1
+		cron_parse_token "$tok" "$lo" "$hi"
+	done
+	[ -n "$any" ] || die "empty cron field"
+}
+
+# cron_matches_at "min hour dom month dow" MIN HOUR DOM MONTH DOW
+# DOW is POSIX %w (0=Sun ... 6=Sat). Cron weekday 7 is also Sunday.
+cron_matches_at() {
+	expr=$1
+	min=$2
+	hour=$3
+	dom=$4
+	month=$5
+	dow=$6
+	set -f
+	# Intentional split into 5 cron fields; globbing is off.
+	# shellcheck disable=SC2046
+	set -- $(normalize_ws "$expr")
+	_count=$#
+	_f1=$1
+	_f2=$2
+	_f3=$3
+	_f4=$4
+	_f5=$5
+	set +f
+	[ "$_count" -eq 5 ] || die "schedule needs 5 cron fields, got $_count ($expr)"
+	cron_field_matches "$min" "$_f1" 0 59 min || return 1
+	cron_field_matches "$hour" "$_f2" 0 23 hour || return 1
+	cron_field_matches "$dom" "$_f3" 1 31 dom || return 1
+	cron_field_matches "$month" "$_f4" 1 12 month || return 1
+	cron_field_matches "$dow" "$_f5" 0 7 dow || return 1
+	return 0
+}
+
+validate_schedule() {
+	expr=$1
+	set -f
+	# Intentional split into 5 cron fields; globbing is off.
+	# shellcheck disable=SC2046
+	set -- $(normalize_ws "$expr")
+	_count=$#
+	_f1=$1
+	_f2=$2
+	_f3=$3
+	_f4=$4
+	_f5=$5
+	set +f
+	[ "$_count" -eq 5 ] || die "schedule needs 5 cron fields (minute hour dom month weekday), got $_count ($expr)"
+	cron_field_validate "$_f1" 0 59 min
+	cron_field_validate "$_f2" 0 23 hour
+	cron_field_validate "$_f3" 1 31 dom
+	cron_field_validate "$_f4" 1 12 month
+	cron_field_validate "$_f5" 0 7 dow
+}
+
+schedule_matches_now() {
+	now=$(TZ=$cfg_timezone date '+%M %H %d %m %w')
+	# Intentional split of `date` fields (MM HH DD mm w).
+	# shellcheck disable=SC2086
+	set -- $now
+	cron_matches_at "$cfg_schedule" "$(unpad "$1")" "$(unpad "$2")" "$(unpad "$3")" "$(unpad "$4")" "$(unpad "$5")"
+}
+
+strip_quotes() {
+	val=$1
+	case $val in
+	\"*\") val=${val#\"}; val=${val%\"} ;;
+	\'*\') val=${val#\'}; val=${val%\'} ;;
+	esac
+	printf '%s\n' "$val"
+}
+
+load_config() {
+	path=$1
+	[ -f "$path" ] || die "config not found: $path
+Copy config.example to that path and set name and schedule."
+	while IFS= read -r line || [ -n "$line" ]; do
+		case $line in
+		'' | \#*) continue ;;
+		esac
+		case $line in
+		*=*) ;;
+		*) die "invalid config line: $line" ;;
+		esac
+		key=${line%%=*}
+		val=$(strip_quotes "${line#*=}")
+		case $key in
+		timezone) cfg_timezone=$val ;;
+		schedule) cfg_schedule=$val ;;
+		start_timeout_seconds) cfg_start_timeout_seconds=$val ;;
+		heartbeat_command) cfg_heartbeat_command=$val ;;
+		name) cfg_name=$val ;;
+		log_dir) cfg_log_dir=$val ;;
+		debug) cfg_debug=$(parse_bool "$val") ;;
+		*) die "unknown config key: $key" ;;
+		esac
+	done <"$path"
+	[ "$cfg_start_timeout_seconds" -ge 1 ] || die "start_timeout_seconds must be >= 1"
+	[ -n "$cfg_name" ] || die "config needs name= (the codespace name from gh codespace list)"
+	[ -n "$cfg_schedule" ] || die "config needs schedule= (5-field crontab expression)"
+	validate_schedule "$cfg_schedule"
+}
+
+require_gh() {
+	command -v gh >/dev/null 2>&1 || die "gh is not on PATH; install GitHub CLI and run gh auth login"
+}
+
+codespace_state() {
+	debug "gh codespace view -c $1 --json state"
+	gh codespace view -c "$1" --json state --template '{{.state}}'
+}
+
+start_codespace() {
+	name=$1
+	if [ "$dry_run" = 1 ]; then
+		log "$name: would start"
+		return 0
+	fi
+	log "$name: starting"
+	debug "POST user/codespaces/$name/start"
+	# 409 = already running; treat as success.
+	if out=$(gh api --method POST "user/codespaces/${name}/start" 2>&1); then
+		debug "start ok"
+		return 0
+	fi
+	case $out in
+	*'409'* | *'Conflict'* | *'already'*)
+		log "$name: start returned conflict (already up)"
+		return 0
+		;;
+	esac
+	printf '%s\n' "$out" >&2
+	die "$name: failed to start"
+}
+
+heartbeat() {
+	name=$1
+	if [ "$dry_run" = 1 ]; then
+		log "$name: would heartbeat"
+		return 0
+	fi
+	log "$name: heartbeat"
+	debug "gh codespace ssh -c $name -- sh -c $cfg_heartbeat_command"
+	gh codespace ssh -c "$name" -- sh -c "$cfg_heartbeat_command" </dev/null
+}
+
+wait_available() {
+	name=$1
+	elapsed=0
+	while [ "$elapsed" -lt "$cfg_start_timeout_seconds" ]; do
+		state=$(codespace_state "$name")
+		debug "wait: elapsed=${elapsed}s state=$state"
+		case $state in
+		Available)
+			return 0
+			;;
+		Starting | Provisioning | Queued | Created | Updating | Rebuilding | Shutdown | Unknown | '')
+			;;
+		*)
+			die "$name: entered state ${state:-unknown}; not waiting"
+			;;
+		esac
+		sleep 10
+		elapsed=$((elapsed + 10))
+	done
+	die "$name: timed out waiting to become Available"
+}
+
+ensure_alive() {
+	name=$1
+	state=$2
+	case $state in
+	Available)
+		heartbeat "$name"
+		log "$name: heartbeat sent (state=$state)"
+		;;
+	Shutdown | Unknown | Starting | Provisioning | Queued | Created)
+		if [ "$state" = Shutdown ] || [ "$state" = Unknown ]; then
+			start_codespace "$name"
+		fi
+		if [ "$dry_run" = 1 ]; then
+			log "$name: would wait for Available then heartbeat (state=$state)"
+			return 0
+		fi
+		wait_available "$name"
+		heartbeat "$name"
+		log "$name: started and heartbeat sent (was $state)"
+		;;
+	*)
+		log "$name: skipped (state=$state)"
+		;;
+	esac
+}
+
+cmd_tick() {
+	if [ "$force" != 1 ] && ! schedule_matches_now; then
+		debug "schedule miss; noop"
+		return 0
+	fi
+	debug "tick name=$cfg_name force=$force dry_run=$dry_run"
+	require_gh
+	ensure_alive "$cfg_name" "$(codespace_state "$cfg_name")"
+}
+
+cmd_daemon() {
+	log "daemon up; checking schedule every 60s timezone=$cfg_timezone"
+	while true; do
+		cmd_tick || true
+		sleep 60
+	done
+}
+
+cmd_status() {
+	printf 'config:     %s\n' "$config_path"
+	printf 'timezone:   %s\n' "$cfg_timezone"
+	printf 'schedule:   %s\n' "$cfg_schedule"
+	printf 'now:        %s\n' "$(TZ=$cfg_timezone date '+%Y-%m-%d %H:%M:%S %Z')"
+	if schedule_matches_now; then
+		printf 'matches:    yes\n'
+	else
+		printf 'matches:    no\n'
+	fi
+	printf 'name:       %s\n' "$cfg_name"
+	printf 'debug:      %s\n' "$debug"
+	printf 'log_dir:    %s\n' "$cfg_log_dir"
+	printf 'log_file:   %s\n' "$log_file"
+	require_gh
+	gh codespace view -c "$cfg_name" --json name,state,lastUsedAt,repository \
+		--template 'state:      {{.state}}
+lastUsedAt: {{.lastUsedAt}}
+repository: {{.repository}}
+'
+}
+
+path_prefix() {
+	printf '%s\n' "${HOME}/.nix-profile/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+}
+
+cron_line() {
+	sched=$(normalize_ws "$cfg_schedule")
+	debug_flag=
+	[ "$debug" = 1 ] && debug_flag=' --debug'
+	printf '%s\n' "CRON_TZ=${cfg_timezone}  # ${MARKER}"
+	printf '%s\n' "${sched} PATH=$(path_prefix) $(script_path) --config ${config_path} tick --force${debug_flag}  # ${MARKER}"
+}
+
+cmd_install() {
+	target=${1:-}
+	case $target in
+	cron)
+		lines=$(cron_line)
+		if [ "$apply" != 1 ]; then
+			printf '# print-only (pass --apply to install)\n%s\n' "$lines"
+			return 0
+		fi
+		current=$(crontab -l 2>/dev/null || true)
+		kept=$(printf '%s\n' "$current" | grep -v "$MARKER" || true)
+		{
+			[ -n "$kept" ] && printf '%s\n' "$kept"
+			printf '%s\n' "$lines"
+		} | crontab -
+		log "installed crontab"
+		printf '%s\n' "$lines"
+		;;
+	systemd)
+		unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+		service="${unit_dir}/${MARKER}.service"
+		timer="${unit_dir}/${MARKER}.timer"
+		debug_exec=
+		[ "$debug" = 1 ] && debug_exec=' --debug'
+		service_body=$(
+			cat <<EOF
+[Unit]
+Description=GitHub Codespaces scheduled keepalive tick
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=$(path_prefix)
+ExecStart=$(script_path) --config ${config_path} tick${debug_exec}
+EOF
+		)
+		timer_body=$(
+			cat <<EOF
+[Unit]
+Description=GitHub Codespaces scheduled keepalive
+
+[Timer]
+OnCalendar=minutely
+Persistent=true
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+		)
+		if [ "$apply" != 1 ]; then
+			printf '# print-only (pass --apply to install)\n%s\n\n%s\n' "$service_body" "$timer_body"
+			return 0
+		fi
+		mkdir -p "$unit_dir"
+		printf '%s\n' "$service_body" >"$service"
+		printf '%s\n' "$timer_body" >"$timer"
+		systemctl --user daemon-reload
+		systemctl --user enable --now "${MARKER}.timer"
+		log "enabled user timer ${MARKER}.timer"
+		;;
+	launchd)
+		plist_path="${HOME}/Library/LaunchAgents/${MARKER}.plist"
+		debug_xml=
+		if [ "$debug" = 1 ]; then
+			debug_xml='    <string>--debug</string>
+'
+		fi
+		plist_body=$(
+			cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${MARKER}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(script_path)</string>
+    <string>--config</string>
+    <string>${config_path}</string>
+    <string>tick</string>
+${debug_xml}  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$(path_prefix)</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${cfg_log_dir}/launchd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${cfg_log_dir}/launchd.stderr.log</string>
+</dict>
+</plist>
+EOF
+		)
+		if [ "$apply" != 1 ]; then
+			printf '# print-only (pass --apply to install)\n%s\n' "$plist_body"
+			return 0
+		fi
+		mkdir -p "$(dirname "$plist_path")"
+		printf '%s\n' "$plist_body" >"$plist_path"
+		launchctl unload "$plist_path" 2>/dev/null || true
+		launchctl load "$plist_path"
+		log "loaded $plist_path"
+		;;
+	*)
+		die "install target must be cron, systemd, or launchd"
+		;;
+	esac
+}
+
+# Sourced by tests (KEEPALIVE_LIB=1): skip argument parsing / main.
+if [ "${KEEPALIVE_LIB:-}" != 1 ]; then
+
+config_path=$DEFAULT_CONFIG
+force=0
+dry_run=0
+apply=0
+cli_debug=0
+cli_log_dir=
+cmd=
+install_target=
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	-h | --help)
+		usage
+		exit 0
+		;;
+	--config)
+		[ $# -ge 2 ] || die "--config needs a path"
+		config_path=$2
+		shift 2
+		;;
+	--force)
+		force=1
+		shift
+		;;
+	--dry-run)
+		dry_run=1
+		shift
+		;;
+	-d | --debug)
+		cli_debug=1
+		shift
+		;;
+	--log-dir)
+		[ $# -ge 2 ] || die "--log-dir needs a path"
+		cli_log_dir=$2
+		shift 2
+		;;
+	--apply)
+		apply=1
+		shift
+		;;
+	tick | daemon | status | install)
+		[ -z "$cmd" ] || die "extra command $1"
+		cmd=$1
+		shift
+		;;
+	cron | systemd | launchd)
+		[ "$cmd" = install ] || die "unexpected argument $1"
+		install_target=$1
+		shift
+		;;
+	*)
+		die "unknown argument: $1 (see --help)"
+		;;
+	esac
+done
+
+[ -n "$cmd" ] || {
+	usage >&2
+	exit 2
+}
+
+load_config "$config_path"
+if [ -n "$cli_log_dir" ]; then
+	cfg_log_dir=$cli_log_dir
+fi
+if [ "$cli_debug" = 1 ] || [ "$cfg_debug" = 1 ]; then
+	debug=1
+fi
+setup_logging
+
+case $cmd in
+tick) cmd_tick ;;
+daemon) cmd_daemon ;;
+status) cmd_status ;;
+install) cmd_install "$install_target" ;;
+*) die "unknown command: $cmd" ;;
+esac
+
+fi
