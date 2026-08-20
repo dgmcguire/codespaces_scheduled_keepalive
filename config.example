@@ -7,24 +7,28 @@
 
 name=your-codespace-name
 
-# IANA timezone used to evaluate `schedule`. install cron also sets CRON_TZ.
+# IANA timezone used to evaluate the policy. install cron also sets CRON_TZ.
 timezone=America/Chicago
 
-# 5-field crontab: minute hour day-of-month month weekday
-#   weekday: 0 or 7 = Sun, 1 = Mon ... 6 = Sat (names like mon-fri also work)
-# Idle timeout is 2 hours, so once an hour is enough.
-# This fires at :00 from 07:00 through 17:00, Monday-Friday.
-schedule=0 7-17 * * 1-5
+# When to heartbeat (2-hour idle timeout → once an hour is enough).
+#   minute    0-59
+#   hours     * (every hour), 8, or 7-17
+#   weekdays  * (every day), 4, or 1-5     0=Sun ... 6=Sat
+# Defaults below are 07:00-17:00 Monday-Friday at :00.
+minute=0
+hours=7-17
+weekdays=1-5
 
 # Seconds to wait after start for the codespace to become Available.
 start_timeout_seconds=300
 
 # Run over `gh codespace ssh` so GitHub records activity.
+# This string is the remote shell command (`sh -c ...` inside the codespace).
 heartbeat_command=true
 
 # Directory for keepalive.log (created if missing). ~ is expanded.
 # Default: $XDG_STATE_HOME/codespaces-keepalive (usually ~/.local/state/...).
 # log_dir=~/.local/state/codespaces-keepalive
 
-# Extra schedule/gh traces in keepalive.log. Also --debug on the CLI.
+# Extra policy/gh traces in keepalive.log. Also --debug on the CLI.
 debug=false

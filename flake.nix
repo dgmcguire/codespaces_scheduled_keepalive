@@ -1,5 +1,5 @@
 {
-  description = "Wake and keep a GitHub Codespace alive on a crontab schedule";
+  description = "Wake and keep a GitHub Codespace alive during configured work hours";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

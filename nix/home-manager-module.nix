@@ -13,7 +13,9 @@ let
   configText = ''
     name=${cfg.codespaceName}
     timezone=${cfg.timezone}
-    schedule=${cfg.schedule}
+    minute=${toString cfg.minute}
+    hours=${cfg.hours}
+    weekdays=${cfg.weekdays}
     start_timeout_seconds=${toString cfg.startTimeoutSeconds}
     heartbeat_command=${cfg.heartbeatCommand}
     debug=${if cfg.debug then "true" else "false"}
@@ -40,13 +42,25 @@ in
     timezone = mkOption {
       type = types.str;
       default = "America/Chicago";
-      description = "IANA timezone used to evaluate `schedule`.";
+      description = "IANA timezone used to evaluate the work-hours policy.";
     };
 
-    schedule = mkOption {
+    minute = mkOption {
+      type = types.ints.between 0 59;
+      default = 0;
+      description = "Minute of the hour to heartbeat (0-59).";
+    };
+
+    hours = mkOption {
       type = types.str;
-      default = "0 7-17 * * 1-5";
-      description = "5-field crontab expression (minute hour dom month weekday).";
+      default = "7-17";
+      description = "Hours to heartbeat: *, a single hour, or a range like 7-17.";
+    };
+
+    weekdays = mkOption {
+      type = types.str;
+      default = "1-5";
+      description = "Weekdays to heartbeat: *, a single day, or a range like 1-5 (0=Sun ... 6=Sat).";
     };
 
     startTimeoutSeconds = mkOption {
@@ -71,7 +85,7 @@ in
     debug = mkOption {
       type = types.bool;
       default = false;
-      description = "Write schedule/gh traces to the log file.";
+      description = "Write policy/gh traces to the log file.";
     };
   };
 
