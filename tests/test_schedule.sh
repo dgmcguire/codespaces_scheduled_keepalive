@@ -95,4 +95,9 @@ grep hello-file "$tmp/keepalive.log" >/dev/null || fail "log did not write file"
 grep should-not-appear "$tmp/keepalive.log" >/dev/null && fail "debug logged while off"
 grep debug-line "$tmp/keepalive.log" >/dev/null || fail "debug did not write file"
 
+case ":$(path_prefix):" in
+*:/bin:* | *:/usr/bin:*) ;;
+*) fail "path_prefix should keep POSIX bin dirs from this host" ;;
+esac
+
 printf 'ok\n'

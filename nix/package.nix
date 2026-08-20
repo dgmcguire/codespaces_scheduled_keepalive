@@ -2,6 +2,8 @@
 , stdenvNoCC
 , makeWrapper
 , gh
+, coreutils
+, gnused
 }:
 
 stdenvNoCC.mkDerivation {
@@ -19,7 +21,7 @@ stdenvNoCC.mkDerivation {
     runHook preInstall
     install -Dm755 bin/codespaces-keepalive $out/bin/codespaces-keepalive
     wrapProgram $out/bin/codespaces-keepalive \
-      --prefix PATH : ${lib.makeBinPath [ gh ]}
+      --prefix PATH : ${lib.makeBinPath [ gh coreutils gnused ]}
     runHook postInstall
   '';
 

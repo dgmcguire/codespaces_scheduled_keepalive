@@ -280,11 +280,11 @@ cron_matches_at() {
 	# shellcheck disable=SC2046
 	set -- $(normalize_ws "$expr")
 	_count=$#
-	_f1=$1
-	_f2=$2
-	_f3=$3
-	_f4=$4
-	_f5=$5
+	_f1=${1-}
+	_f2=${2-}
+	_f3=${3-}
+	_f4=${4-}
+	_f5=${5-}
 	set +f
 	[ "$_count" -eq 5 ] || die "schedule needs 5 cron fields, got $_count ($expr)"
 	cron_field_matches "$min" "$_f1" 0 59 min || return 1
@@ -302,11 +302,11 @@ validate_schedule() {
 	# shellcheck disable=SC2046
 	set -- $(normalize_ws "$expr")
 	_count=$#
-	_f1=$1
-	_f2=$2
-	_f3=$3
-	_f4=$4
-	_f5=$5
+	_f1=${1-}
+	_f2=${2-}
+	_f3=${3-}
+	_f4=${4-}
+	_f5=${5-}
 	set +f
 	[ "$_count" -eq 5 ] || die "schedule needs 5 cron fields (minute hour dom month weekday), got $_count ($expr)"
 	cron_field_validate "$_f1" 0 59 min
@@ -496,7 +496,29 @@ repository: {{.repository}}
 }
 
 path_prefix() {
-	printf '%s\n' "${HOME}/.nix-profile/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+	# Snapshot this process's PATH (existing dirs only) so systemd/launchd/cron
+	# match the shell that ran `install`. Do not hardcode other OS layouts.
+	_out=
+	_saved_ifs=$IFS
+	set -f
+	IFS=:
+	# shellcheck disable=SC2086
+	set -- $PATH /usr/bin /bin
+	IFS=$_saved_ifs
+	set +f
+	for _dir in "$@"; do
+		[ -n "$_dir" ] || continue
+		[ -d "$_dir" ] || continue
+		case ":${_out}:" in
+		*":${_dir}:"*) continue ;;
+		esac
+		if [ -n "$_out" ]; then
+			_out="${_out}:${_dir}"
+		else
+			_out=$_dir
+		fi
+	done
+	printf '%s\n' "$_out"
 }
 
 cron_line() {

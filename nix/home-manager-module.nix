@@ -97,6 +97,8 @@ in
         };
         Service = {
           Type = "oneshot";
+          # Wrapped package already prefixes gh/coreutils; this covers a bare script too.
+          Environment = "PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.gh pkgs.gnused ]}";
           ExecStart = "${lib.getExe cfg.package} tick${optionalString cfg.debug " --debug"}";
         };
       };
@@ -123,6 +125,11 @@ in
           ] ++ lib.optionals cfg.debug [ "--debug" ];
           StartInterval = 60;
           RunAtLoad = true;
+          EnvironmentVariables.PATH = lib.makeBinPath [
+            pkgs.coreutils
+            pkgs.gh
+            pkgs.gnused
+          ];
           StandardOutPath = "${config.home.homeDirectory}/.local/state/codespaces-keepalive/launchd.stdout.log";
           StandardErrorPath = "${config.home.homeDirectory}/.local/state/codespaces-keepalive/launchd.stderr.log";
         };

@@ -37,6 +37,8 @@ codespaces-keepalive install cron --apply
 
 `install` prints the unit or crontab by default; `--apply` writes it. Confirm with `codespaces-keepalive status`.
 
+Run `--apply` from a login shell that can already find `gh`, `date`, and `tr`. The installer snapshots that `PATH` (existing directories only, plus `/usr/bin:/bin`) into the timer, so NixOS does not inherit a macOS Homebrew layout and vice versa. The Nix package and home-manager module wrap those tools instead of relying on the snapshot.
+
 ## Shape
 
 ```
