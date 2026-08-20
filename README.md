@@ -2,19 +2,40 @@
 
 Wake a GitHub Codespace before work and keep it alive on a crontab schedule.
 
-## Why POSIX sh
+## Install (Linux and macOS)
 
-The portable core is a **oneshot `tick`** plus an **OS timer**. The runtime is `/bin/sh` + `gh`, which both Linux and macOS already have.
+Needs [GitHub CLI](https://cli.github.com/) (`gh auth login`) with codespace access, and a machine that is **already on** before work. A sleeping laptop will not fire the timer.
 
-| Option | On Linux + macOS? | Catch |
-| --- | --- | --- |
-| POSIX `/bin/sh` | Yes (dash, ash, or bash-as-sh) | Avoid GNU `date -d` / BSD `date -v` |
-| bash | macOS is still 3.2 unless you brew it | Arrays, `[[`, `${var,,}` are traps |
-| systemd timers | Linux only | Best *Linux* timer |
-| launchd | macOS only | Best *macOS* timer |
-| cron | Both | Best *shared* timer; same 5-field dialect as `schedule` |
+```sh
+git clone https://github.com/dgmcguire/codespaces_scheduled_keepalive.git
+cd codespaces_scheduled_keepalive
 
-`schedule` is evaluated with POSIX `date` and `TZ` (same on GNU and BSD). Date *arithmetic* is not portable, so the daemon does not sleep-until-next-fire; it wakes every minute and asks `tick` whether the expression matches now.
+mkdir -p ~/.local/bin ~/.config/codespaces-keepalive
+install -m 755 bin/codespaces-keepalive ~/.local/bin/codespaces-keepalive
+cp config.example ~/.config/codespaces-keepalive/config
+```
+
+Edit `~/.config/codespaces-keepalive/config`: set `name` from `gh codespace list`, plus `timezone` and `schedule`. Put `~/.local/bin` on your `PATH` if it is not already.
+
+**Linux** (systemd user timer, catch-up after the machine was off):
+
+```sh
+codespaces-keepalive install systemd --apply
+```
+
+**macOS** (LaunchAgent, every 60s; `tick` applies `schedule`):
+
+```sh
+codespaces-keepalive install launchd --apply
+```
+
+**Either OS** (crontab = `schedule`):
+
+```sh
+codespaces-keepalive install cron --apply
+```
+
+`install` prints the unit or crontab by default; `--apply` writes it. Confirm with `codespaces-keepalive status`.
 
 ## Shape
 
@@ -66,26 +87,11 @@ schedule=0 8-18 * * mon-fri   # same idea with names
 
 ## Usage
 
-Needs [GitHub CLI](https://cli.github.com/) (`gh auth login`) with codespace access.
-
 ```sh
-bin/codespaces-keepalive status
-bin/codespaces-keepalive tick --dry-run
-bin/codespaces-keepalive tick --force    # ignore schedule
-bin/codespaces-keepalive tick --debug --log-dir /tmp/cs-keep
-```
-
-Install a timer. Default is print-only; pass `--apply` to write it.
-
-```sh
-# Most portable (Linux + macOS): crontab = `schedule`
-bin/codespaces-keepalive install cron --apply
-
-# Linux (minutely + Persistent=true catch-up)
-bin/codespaces-keepalive install systemd --apply
-
-# macOS (wake every 60s; tick applies schedule)
-bin/codespaces-keepalive install launchd --apply
+codespaces-keepalive status
+codespaces-keepalive tick --dry-run
+codespaces-keepalive tick --force    # ignore schedule
+codespaces-keepalive tick --debug --log-dir /tmp/cs-keep
 ```
 
 ## What `tick` does
